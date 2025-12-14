@@ -1,0 +1,822 @@
+---
+title: "Inferencia Bayesiana aplicada a Hipótesis Macroeconómicas"
+author: "Pedro Bosch, Nicolas Caricati, Agustín Rivas"
+date: "20/11/2025"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    df_print: paged
+    theme: united
+    code_download: true
+  pdf_document:
+    toc: true
+subtitle: TP – Enfoque Estadístico del Aprendizaje
+---
+
+# Objetivo
+
+El objetivo de este informe es estimar la regla de Taylor utilizando métodos tradicionales (OLS) y modelos bayesianos. Para la especificación de los priors y ciertos parámetros de referencia se utilizan valores documentados en distintos trabajos académicos, en particular un artículo del BIS (Bank for International Settlements), que presenta información acerca de política monetaria.
+
+# Configuración Inicial
+
+## Importación de librerías
+
+Para el desarrollo del análisis se requiere la carga de librerías específicas para el manejo y transformación de datos, el trabajo con fechas, la estimación de modelos bayesianos y la generación de gráficos.
+
+```{r lib, message=FALSE, warning=FALSE}
+library(lubridate)
+library(dplyr)
+library(bayesreg)   
+library(MCMCpack)
+library(tidyr)
+library(cmdstanr)
+library(brms)
+library(broom)
+library(tidybayes)
+library(ggplot2)
+library(ggdist)
+library(bayesplot)
+library(posterior)
+library(plotly)
+library(gridExtra)
+library(scales)
+library(rlang)
+library(purrr)
+```
+
+## Importación del dataset
+
+Se define el directorio de trabajo y luego se importa el archivo que contiene las series macroeconómicas utilizadas en el análisis.
+
+```{r imp}
+setwd("G:/My Drive/TP EEA")
+
+dataset <- read.csv("G:/My Drive/TP EEA/2025-09-QD.csv")
+
+head(dataset)
+
+gdppot <- read.csv("GDPPOT.csv")
+
+head(gdppot)
+
+```
+
+## Transformación de datos
+Se realizan correcciones necesarias antes del análisis y se mergean los datasets.
+```{r tr}
+dataset <- dataset[-c(1, 2), ]  # Se eliminan filas iniciales
+dataset$sasdate <- as.Date(dataset$sasdate, format = "%m/%d/%Y")  # Conversión a fechas
+dataset$quarter_label <- paste0(year(dataset$sasdate), "Q", quarter(dataset$sasdate)) # Etiqueta trimestral
+dataset <- dataset[order(dataset$sasdate), ]   # Orden temporal
+dataset$time_index <- seq_len(nrow(dataset))    # Índice de tiempo
+dataset <- dataset %>% relocate(quarter_label, time_index, .after = 1)  # Reorganización de columnas
+```
+```{r tr2}
+gdppot$observation_date <- gsub("-", "/", gdppot$observation_date)
+gdppot$observation_date <- as.Date(gdppot$observation_date, format = "%m/%d/%Y") # Conversión a fechas
+
+dataset <- dataset %>%
+  left_join(
+    gdppot,
+    by = c("sasdate" = "observation_date")
+  )
+
+ #Selecciono variables
+df <- dataset %>%
+  dplyr::select(
+    sasdate,
+    quarter_label,
+    time_index,
+    PCECTPI,
+    GDPC1,
+    GDPPOT,
+    FEDFUNDS,
+    TCU, #variable de control
+    USGOVT, #variable de control
+    UNRATE, #variable de control
+    DGDSRG3Q086SBEA, #variable de control
+    GS10TB3Mx, #variable de control
+    CPF3MTB3Mx, #variable de control
+    BOGMBASEREALx #variable de control
+  )
+
+# Filtrar el rango de fechas para las series
+df_filtered <- df %>%
+  filter(sasdate > as.Date("1980-01-01") & sasdate < as.Date("2007-01-01"))
+
+head(df_filtered)
+```
+
+# Análisis Exploratorio
+
+La Regla de Taylor es un modelo ampliamente utilizado en macroeconomía para describir cómo debería reaccionar la política monetaria ante desvíos de la inflación respecto de su meta y ante fluctuaciones del producto respecto de su nivel potencial. Para estimarla empíricamente, se requiere construir una serie de variables macroeconómicas clave: el *output gap*, la inflación trimestral y la brecha de inflación (*inflation gap*).
+
+## Selección de variables relevantes
+En primer lugar, se construye un subconjunto del dataset original conservando únicamente las series necesarias para el análisis. Las principales variables macroeconómicas utilizadas son:
+
+- **PCECTPI** — Índice de Precios de los Gastos en Consumo Personal: indicador de inflación utilizado por la Reserva Federal de Estados Unidos. Mide la evolución del nivel de precios de bienes y servicios consumidos por los hogares.
+- **GDPC1** — Producto Bruto Interno Real: mide el nivel de actividad económica ajustado por inflación y refleja la cantidad real de bienes y servicios producidos en la economía.
+- **GDPPOT** — Producto Potencial: representa el nivel de producción que la economía podría sostener de manera sostenible, sin generar presiones inflacionarias persistentes.
+- **FEDFUNDS** — Tasa de Fondos Federales: tasa de interés de referencia fijada por la Reserva Federal.
+```{r select_vars, message=FALSE, warning=FALSE}
+
+# 1) Producto (GDPC1 y GDPPOT) juntos
+df_productos <- df_filtered %>%
+  dplyr::select(sasdate, GDPC1, GDPPOT) %>%
+  pivot_longer(cols = c(GDPC1, GDPPOT), names_to = "variable", values_to = "value")
+
+p1 <- ggplot(df_productos, aes(x = sasdate, y = value, color = variable)) +
+  geom_line(size = 1) +
+  labs(title = "Producto Interno Bruto Real y Producto Potencial",
+       x = "Fecha",
+       y = "Valor") +
+  theme_minimal() +
+  theme(legend.title = element_blank())
+
+# 2) Tasa de interés FEDFUNDS sola
+df_tasa <- df_filtered %>%
+  dplyr::select(sasdate, FEDFUNDS)
+
+p2 <- ggplot(df_tasa, aes(x = sasdate, y = FEDFUNDS)) +
+  geom_line(color = "steelblue", size = 1) +
+  labs(title = "Tasa de Fondos Federales (FEDFUNDS)",
+       x = "Fecha",
+       y = "Tasa (%)") +
+  theme_minimal()
+
+# Mostrar los gráficos uno debajo del otro
+grid.arrange(p1, p2, ncol = 1)
+
+```
+
+## Output Gap
+El output gap mide el desvío porcentual del Producto Interno Bruto real (GDPC1) respecto de su nivel potencial (GDPPOT). La siguiente transformación calcula esta brecha en puntos porcentuales:
+```{r output_gap}
+df <- df %>%
+  mutate(
+    y_gap = 100 * (GDPC1 - GDPPOT) / GDPPOT)
+
+
+# Seleccionamos la variable y pasamos a formato largo
+df_long <- df %>%
+  dplyr::select(sasdate,y_gap) %>%
+  pivot_longer(cols = -sasdate, names_to = "variable", values_to = "value")
+
+df_long <- df_long %>%
+  filter(sasdate > as.Date("1980-01-01") & sasdate < as.Date("2007-01-01") )
+
+# Gráfico histórico
+ggplot(df_long, aes(x = sasdate, y = value, color = variable)) +
+  geom_line(size = 1) +
+  facet_wrap(~variable, scales = "free_y", ncol = 2) +
+  labs(title = "Series historicas del y_gap",
+       x = "Fecha",
+       y = "Valor") +
+  theme_minimal()
+
+```
+
+## Inflation Gap
+La brecha de inflación mide el desvío entre la inflación observada y la meta implícita de la Reserva Federal. Para este trabajo se utiliza un objetivo anual del 2%, que en frecuencia trimestral equivale aproximadamente a 0,5%. La variable pi_gap se define entonces como la diferencia entre la inflación trimestral estimada a partir del índice PCE y esta meta.
+
+```{r inf_gap}
+# Inflacion Trimestral objetivo
+pi_star_q <- 0.5
+
+# Extraemos del indice de precios la inflacion trimestral con la aproximacion log-diff
+df <- df %>%
+  arrange(sasdate) %>%
+  mutate(
+    infl_q = 100 * (log(PCECTPI) - dplyr::lag(log(PCECTPI), 1)), # inflación trimestral en % (aprox log-diff)
+    pi_gap = infl_q - pi_star_q
+  ) %>%
+  drop_na(pi_gap)
+
+# Seleccionamos la variable y pasamos a formato largo
+df_long <- df %>%
+  dplyr::select(sasdate,pi_gap) %>%
+  pivot_longer(cols = -sasdate, names_to = "variable", values_to = "value")
+
+df_long <- df_long %>%
+  filter(sasdate > as.Date("1980-01-01") & sasdate < as.Date("2007-01-01") )
+
+# Gráfico histórico
+ggplot(df_long, aes(x = sasdate, y = value, color = variable)) +
+  geom_line(size = 1) +
+  facet_wrap(~variable, scales = "free_y", ncol = 2) +
+  labs(title = "Series historicas del desvio de la inflacion respecto a la objetiva",
+       x = "Fecha",
+       y = "Valor") +
+  theme_minimal()
+
+```
+
+## Inercia de la tasa de interés
+Para capturar el comportamiento gradual de la política monetaria, se incorpora la tasa de fondos federales rezagada un período (i_lag1). Esta variable refleja la inercia típica con la que la Reserva Federal ajusta la tasa de interés, dado que los cambios suelen realizarse de manera progresiva y no abrupta de un trimestre a otro. 
+```{r inercia}
+# Contruimos las variables lags de interes y cambio en la tasa de interes
+df <- df %>%
+  arrange(sasdate) %>%
+  mutate(
+    i_lag1   = dplyr::lag(FEDFUNDS, 1), # tasa rezagada 1
+    delta_i  = FEDFUNDS - i_lag1 # cambio en la tasa
+  ) %>%
+  drop_na(i_lag1, delta_i)
+
+df_long <- df %>%
+  dplyr::select(sasdate, delta_i, FEDFUNDS) %>%
+  pivot_longer(cols = -sasdate, names_to = "variable", values_to = "value") %>%
+  filter(sasdate > as.Date("1980-01-01") & sasdate < as.Date("2007-01-01")) %>%
+  mutate(
+    variable = recode(variable,
+                      FEDFUNDS = "FEDFUNDS",
+                      delta_i  = "Delta_i"),
+    variable = factor(variable, levels = c("FEDFUNDS", "Delta_i"))
+  )
+
+ggplot(df_long, aes(x = sasdate, y = value, color = variable)) +
+  geom_line(size = 1) +
+  facet_wrap(~variable, scales = "free_y", nrow = 2) +
+  labs(
+    title = "Series históricas de la tasa de interés y su cambio respecto al trimestre anterior",
+    x = "Fecha",
+    y = "Valor",
+    color = "Variables"
+  ) +
+  scale_color_manual(
+    values = c("FEDFUNDS" = "#1F77B4", "Delta_i" = "#FF7F0E"),
+    labels = c("FEDFUNDS" = "FEDFUNDS", "Delta_i" = "Delta_i")
+  ) +
+  scale_y_continuous(labels = scales::label_number(accuracy = 0.1)) +
+  theme_minimal()
+
+
+```
+
+## Análisis Estadisticos de las variables
+En primer lugar, analizaremos las variables a través de sus medidas de tendencia para el periodo en cuestión.
+```{r analisis estadistico}
+
+df_desc <- df %>% filter(sasdate > as.Date("1980-01-01") & sasdate < as.Date("2007-01-01") )
+
+df_desc <- df_desc %>% dplyr::select(GDPC1, GDPPOT, FEDFUNDS, y_gap, infl_q, pi_gap, delta_i)
+
+summary_stats <- df_desc %>%
+  summarise(
+    across(
+      everything(),
+      list(
+        min  = ~min(. , na.rm = TRUE),
+        max  = ~max(. , na.rm = TRUE),
+        mean = ~mean(. , na.rm = TRUE),
+        sd   = ~sd(. , na.rm = TRUE)
+      ),
+      .names = "{.col}_{.fn}"
+    )
+  ) %>%
+  pivot_longer(
+    everything(),
+    names_to = c("variable", "stat"),
+    names_pattern = "(.*)_(.*)"
+  ) %>%
+  pivot_wider(names_from = stat, values_from = value) %>%
+  mutate(across(where(is.numeric), ~round(. , 2)))
+
+summary_stats
+
+
+```
+En segundo lugar, analizaremos la evolución de las variables desde el enfoque histórico de las series de tiempo. Con el fin de representarlas de manera conjunta en un mismo gráfico, recurrimos al proceso de estandarización. Este procedimiento transforma cada observación en un z‑score, es decir, en la cantidad de desviaciones estándar que dicho valor se encuentra por encima o por debajo de la media de la variable. De esta forma, las tres series quedan expresadas en una escala común, lo que facilita la comparación de sus dinámicas a lo largo del tiempo.
+
+```{r graficos historicos}
+
+# Seleccionamos las variables y pasamos a formato largo
+
+df_norm <- df %>%
+  dplyr::select(sasdate, FEDFUNDS, pi_gap, y_gap) %>%
+  mutate(
+    FEDFUNDS_z = scale(FEDFUNDS),
+    pi_gap_z   = scale(pi_gap),
+    y_gap_z    = scale(y_gap)
+  ) %>%
+  dplyr::select(sasdate, FEDFUNDS_z, pi_gap_z, y_gap_z) %>%
+  pivot_longer(
+    cols = -sasdate,
+    names_to = "variable",
+    values_to = "value"
+  )  %>% 
+    filter(sasdate > as.Date("1980-01-01") & sasdate < as.Date("2007-01-01") )
+
+p <- ggplot(df_norm, aes(
+    x = sasdate,
+    y = value,
+    color = variable,
+    group = variable,
+    text = paste0(
+      "Fecha: ", format(sasdate, "%Y-%m"), "<br>",
+      "Variable: ", dplyr::recode(variable,
+                                  FEDFUNDS_z = "Tasa Fed",
+                                  pi_gap_z   = "Inflation gap",
+                                  y_gap_z    = "Output gap"), "<br>",
+      "Valor: ", sprintf("%.2f", value)
+    )
+  )) +
+  geom_line(size = 1.2) +
+  labs(
+    title = "Evolución comparada: tasa de la Fed y brechas (normalizadas)",
+    x = "Fecha",
+    y = "Valores normalizados (z-score)",
+    color = NULL
+  ) +
+  scale_color_manual(
+    values = c(
+      FEDFUNDS_z = "#1F77B4",
+      pi_gap_z   = "#AEC7E8",
+      y_gap_z    = "#98DF8A"
+    ),
+    labels = c("Tasa Fed", "Inflation gap", "Output gap")
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "bottom",
+    legend.text = element_text(size = 9),
+    plot.title = element_text(face = "bold", size = 12, hjust = 0.5),
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(color = "gray30")
+  )
+
+ggplotly(p, tooltip = "text") %>%
+  layout(
+    legend = list(
+      orientation = "h",
+      x = 0.2,
+      y = 0.1
+    )
+  )
+
+
+```
+
+# Regresiones
+
+## OLS
+Se determina una ventana temporal y se procede con la regresión tradicional.
+```{r reg}
+df_reg_sub <- df %>%
+  filter(sasdate > as.Date("1980-01-01") & sasdate < as.Date("2007-01-01") )
+```
+```{r reg_result}
+taylor_ols <- lm(
+  FEDFUNDS ~ i_lag1 + pi_gap + y_gap,
+  data = df_reg_sub
+)
+
+summary(taylor_ols)
+```
+La estimación OLS de la Regla de Taylor arroja un coeficiente de inercia elevado para la tasa de interés (i_lag1 ≈ 0,89), lo que indica que la Reserva Federal ajusta la política monetaria de manera gradual. Tanto la brecha de inflación (pi_gap ≈ 0,89) como el output gap (y_gap ≈ 0,17) presentan signos positivos y son estadísticamente significativos, en línea con la idea de que la tasa de fondos federales aumenta cuando la inflación se ubica por encima de la meta y cuando la actividad se sitúa por encima de su nivel potencial. El modelo exhibe un muy buen ajuste (R² ≈ 0,94), por lo que la especificación estimada captura razonablemente bien el comportamiento histórico de la política monetaria en el período considerado.
+
+## Regresión Bayesiana #1 - Priors Débiles
+Además de la estimación mediante Mínimos Cuadrados Ordinarios, se implementó una versión bayesiana de la Regla de Taylor. Este enfoque permite combinar la información presente en los datos con conocimiento previo sobre el comportamiento típico de la política monetaria. Para esta primera especificación se utilizaron priors informativas basadas en estimaciones reportadas en estudios del BIS, que reflejan valores típicos para la inercia monetaria y las respuestas a inflación y actividad económica.
+
+```{r bayes_v1, message=FALSE, warning=FALSE}
+priors_v1 <- c(
+  prior(normal(0,    5), class = "Intercept"),
+  prior(normal(0.74, 2), class = "b", coef = "i_lag1"),
+  prior(normal(2.11, 2), class = "b", coef = "pi_gap"),
+  prior(normal(0.26, 2), class = "b", coef = "y_gap"),
+  
+# Prior débil para sigma (desvío estándar residual)
+  prior(student_t(3, 0, 10), class = "sigma")
+)
+
+set.seed(42)
+
+taylor_bayes_v1_brms <- brm(
+  FEDFUNDS ~ i_lag1 + pi_gap + y_gap,
+  data   = df_reg_sub,
+  family = gaussian(),
+  prior  = priors_v1,
+  chains = 4,
+  iter   = 15000,   # total draws por cadena
+  warmup = 5000,    # burn-in
+  cores  = 4,
+  seed   = 42,
+  sample_prior = "yes"
+)
+```
+```{r bayes_v1_result}
+summary(taylor_bayes_v1_brms)
+```
+Los resultados bayesianos con priors débiles son muy similares a los de OLS: los coeficientes de inercia, inflación y output gap mantienen magnitudes casi idénticas y continúan siendo claramente significativos. Los intervalos al 95% reflejan la misma información que los intervalos de confianza clásicos, indicando que las priors no alteran sustancialmente la estimación. En síntesis, el modelo bayesiano reproduce de manera consistente la estructura obtenida por OLS.
+
+## Regresión Bayesiana #2 - Priors Fuertes
+En esta segunda especificación se mantiene la misma estructura del modelo, pero se reemplazan las priors débiles por priors mucho más concentradas, basadas en estimaciones del BIS. Esto permite evaluar cuánto influyen las creencias previas en los coeficientes de la Regla de Taylor, forzando al modelo a comenzar desde valores muy específicos para la inercia monetaria, la respuesta a la inflación y la respuesta al ciclo.
+
+```{r bayes_v2, message=FALSE, warning=FALSE}
+priors_v2 <- c(
+  prior(normal(0,    5.0), class = "Intercept"),
+  prior(normal(0.74, 0.10), class = "b", coef = "i_lag1"),
+  prior(normal(2.11, 0.10), class = "b", coef = "pi_gap"),
+  prior(normal(0.26, 0.05), class = "b", coef = "y_gap"),
+  
+# Prior débil para sigma (análogo a inv-gamma muy plana en sigma^2)
+  prior(student_t(3, 0, 10), class = "sigma")
+)
+
+set.seed(42)
+
+taylor_bayes_v2_brms <- brm(
+  FEDFUNDS ~ i_lag1 + pi_gap + y_gap,
+  data   = df_reg_sub,
+  family = gaussian(),
+  prior  = priors_v2,
+  
+  chains = 4,
+  iter   = 15000,
+  warmup = 5000,
+  cores  = 4,
+  seed   = 42,
+  sample_prior = "yes"
+)
+```
+```{r bayes_v2_result}
+summary(taylor_bayes_v2_brms)
+```
+Los resultados con priors fuertes muestran coeficientes claramente influenciados por la información previa: la respuesta a la inflación aumenta de manera marcada (≈ 1.95), mientras que la inercia monetaria se reduce (≈ 0.79), moviéndose ambos en dirección a los valores fijados en las priors. El output gap también presenta un coeficiente mayor (≈ 0.22). Todos los parámetros resultan estadísticamente significativos reflejando la mayor precisión impuesta por las priors. En conjunto, esta versión del modelo ilustra cómo priors más concentradas pueden modificar sustancialmente las estimaciones.
+
+# Análisis Gráfico
+
+## 1) Forest plot
+El gráfico compara los coeficientes estimados por OLS con las distribuciones posteriores obtenidas bajo los modelos bayesianos con priors débiles y fuertes. Se observa que, mientras la versión con priors débiles reproduce casi exactamente los valores de OLS, las priors fuertes desplazan las distribuciones hacia los valores impuestos por la información previa, especialmente en la respuesta a la inflación. Esto permite visualizar de manera directa cómo el peso de las priors afecta la estimación de cada parámetro.
+```{r forest, message=FALSE, warning=FALSE}
+# i) Coeficientes OLS
+ols_tidy <- broom::tidy(taylor_ols, conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(model = "OLS")
+
+# ii) Coeficientes Bayes: draws de brms
+b1_draws <- taylor_bayes_v1_brms %>%
+  spread_draws(b_i_lag1, b_pi_gap, b_y_gap) %>%
+  dplyr::select(b_i_lag1, b_pi_gap, b_y_gap) %>%
+  pivot_longer(cols = everything(),
+               names_to = "term",
+               values_to = "value") %>%
+  mutate(model = "Modelo con priors débiles")
+
+b2_draws <- taylor_bayes_v2_brms %>%
+  spread_draws(b_i_lag1, b_pi_gap, b_y_gap) %>%
+  dplyr::select(b_i_lag1, b_pi_gap, b_y_gap) %>%
+  pivot_longer(cols = everything(),
+               names_to = "term",
+               values_to = "value") %>%
+  mutate(model = "Modelo con priors fuertes")
+
+bayes_draws <- bind_rows(b1_draws, b2_draws) %>%
+  mutate(term = recode(term,
+                       b_i_lag1 = "i_lag1 (rho)",
+                       b_pi_gap = "pi_gap (phi_pi)",
+                       b_y_gap  = "y_gap (phi_y)"))
+
+ols_tidy <- ols_tidy %>%
+  mutate(term = recode(term,
+                       i_lag1 = "i_lag1 (rho)",
+                       pi_gap = "pi_gap (phi_pi)",
+                       y_gap  = "y_gap (phi_y)"))
+
+# iii) Gráfico combinado
+ggplot(bayes_draws, aes(x = value, y = term, fill = model)) +
+  stat_halfeye(alpha = 0.7, point_interval = median_qi, .width = 0.95) +
+  geom_point(data = ols_tidy, aes(x = estimate, y = term),
+             inherit.aes = FALSE, shape = 21, size = 2.2, fill = "white") +
+  geom_errorbarh(data = ols_tidy,
+                 aes(xmin = conf.low, xmax = conf.high, y = term),
+                 inherit.aes = FALSE, height = 0.15) +
+  labs(x = "Valor del coeficiente", y = NULL,
+       title = "OLS vs Bayes",
+       subtitle = "Distribuciones posteriores y IC OLS") +
+  theme_minimal()
+```
+
+##  2) Prior vs Posterior (para #1 y #2)
+El gráfico muestra cómo se comparan las distribuciones prior y posterior en ambos modelos. Con priors débiles, los datos modifican fuertemente la distribución posterior. Con priors fuertes, la posterior permanece muy cerca de la prior, indicando que la información previa tiene mucho más peso en la estimación.
+```{r prior_post, message=FALSE, warning=FALSE} 
+pars <- c("b_i_lag1", "b_pi_gap", "b_y_gap")
+
+make_prior_post_long <- function(fit, label){
+  prior_df <- prior_draws(fit) %>%
+    as_draws_df() %>%
+    dplyr::select(all_of(pars)) %>%
+    pivot_longer(everything(), names_to = "term", values_to = "value") %>%
+    mutate(type = "Prior", model = label)
+  
+  post_df <- as_draws_df(fit) %>%
+    dplyr::select(all_of(pars)) %>%
+    pivot_longer(everything(), names_to = "term", values_to = "value") %>%
+    mutate(type = "Posterior", model = label)
+  
+  bind_rows(prior_df, post_df)
+}
+
+df_v1 <- make_prior_post_long(taylor_bayes_v1_brms, "Priors débiles")
+df_v2 <- make_prior_post_long(taylor_bayes_v2_brms, "Priors fuertes")
+
+df_all <- bind_rows(df_v1, df_v2) %>%
+  mutate(
+    term = recode(term,
+                  b_i_lag1 = "i_lag1 (rho)",
+                  b_pi_gap = "pi_gap (phi_pi)",
+                  b_y_gap  = "y_gap (phi_y)"),
+    term = factor(term, levels = c("i_lag1 (rho)", "pi_gap (phi_pi)", "y_gap (phi_y)"))
+  )
+
+ggplot(df_all, aes(x = value, y = term, fill = type)) +
+  stat_halfeye(alpha = 0.6, position = "identity",
+               point_interval = median_qi, .width = 0.95) +
+  facet_wrap(~model) +
+  coord_cartesian(xlim = c(-1, 4)) +
+  labs(
+    title = "Prior vs Posterior por modelo",
+    subtitle = "Comparación visual para priors débiles y fuertes",
+    x = "Valor del coeficiente", y = NULL
+  ) +
+  theme_minimal()
+```
+
+## 3) Comparación Predictiva: Fitted vs actual
+El gráfico compara la tasa observada con las predicciones obtenidas por OLS y por los modelos bayesianos con priors débiles y fuertes. En ambos casos, las predicciones bayesianas siguen muy de cerca la trayectoria histórica de la tasa de fondos federales, y las bandas creíbles (50% y 95%) son estrechas, indicando buena precisión del modelo. Las priors fuertes producen intervalos ligeramente más concentrados, reflejando mayor peso de la información previa.
+```{r predict, message=FALSE, warning=FALSE} 
+df_plot <- df_reg_sub %>%
+  mutate(fit_ols = predict(taylor_ols, newdata = df_reg_sub))
+
+pred_v1 <- df_reg_sub %>%
+  add_epred_draws(taylor_bayes_v1_brms, ndraws = 2000)
+
+pred_v2 <- df_reg_sub %>%
+  add_epred_draws(taylor_bayes_v2_brms, ndraws = 2000)
+
+summ_pred <- function(pred_df, label){
+  pred_df %>%
+    group_by(sasdate) %>%
+    median_qi(.epred, .width = c(0.5, 0.95)) %>%
+    mutate(model = label)
+}
+
+p1 <- summ_pred(pred_v1, "Bayes priors débiles")
+p2 <- summ_pred(pred_v2, "Bayes priors fuertes")
+
+pred_bands <- bind_rows(p1, p2)
+
+ggplot(df_plot, aes(x = sasdate, y = FEDFUNDS)) +
+  geom_line(color = "black") +
+  geom_line(aes(y = fit_ols), linetype = "dashed") +
+  stat_lineribbon(data = pred_bands,
+                  aes(y = .epred, ymin = .lower, ymax = .upper, fill = model),
+                  alpha = 0.25) +
+  facet_wrap(~model, ncol = 1) +
+  labs(title = "Predicción: OLS vs Bayes",
+       subtitle = "Bandas creíbles 50% y 95%",
+       y = "FEDFUNDS", x = NULL) +
+  theme_minimal()
+```
+
+## 4) Distribucion de reacción a inflación
+La figura muestra la distribución posterior del parámetro que mide la respuesta de la tasa de interés a la inflación (ϕπ) bajo ambos conjuntos de priors. Con priors débiles, la distribución es más dispersa y centrada alrededor de valores cercanos a 1, mientras que con priors fuertes se concentra en torno al benchmark de 2.11 propuesto por el BIS (línea punteada). Esto ilustra cómo la información previa influye en la magnitud estimada de la reacción de política monetaria.
+```{r inf, message=FALSE, warning=FALSE} 
+b1_phi_pi <- as_draws_df(taylor_bayes_v1_brms)$b_pi_gap
+b2_phi_pi <- as_draws_df(taylor_bayes_v2_brms)$b_pi_gap
+
+df_phi <- tibble(
+  value = c(b1_phi_pi, b2_phi_pi),
+  model = rep(c("Priors débiles","Priors fuertes"),
+              c(length(b1_phi_pi), length(b2_phi_pi)))
+)
+
+ggplot(df_phi, aes(x = value, fill = model)) +
+  geom_density(alpha = 0.5) +
+  geom_vline(
+    xintercept = 2.11,
+    linetype = "dotted",
+    linewidth = 1.2,
+    color = "black",
+    alpha = 0.9
+  ) +
+  labs(title = "Respuesta a inflación (phi_pi)",
+       subtitle = "Línea punteada = benchmark BIS",
+       x = expression(phi[pi]), y = "Densidad") +
+  theme_minimal()
+```
+
+## 5) Stacked PPC
+Los gráficos PPC permiten evaluar si los modelos bayesianos pueden reproducir la distribución observada de la tasa de interés. Tanto el modelo con priors débiles como el de priors fuertes generan distribuciones simuladas coherentes con los datos reales, lo que indica un ajuste adecuado.
+```{r ppc, message=FALSE, warning=FALSE} 
+pp_check(taylor_bayes_v1_brms,
+         type = "dens_overlay",
+         ndraws = 50) +
+  ggtitle("PPC - Priors Débiles") +
+  labs(x = "FEDFUNDS", y = "Densidad") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  theme_minimal(base_size = 12)
+
+pp_check(taylor_bayes_v2_brms,
+         type = "dens_overlay",
+         ndraws = 50) +
+  ggtitle("PPC - Priors Fuertes") +
+  labs(x = "FEDFUNDS", y = "Densidad") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  theme_minimal(base_size = 12)
+```
+
+# Bayesian Lasso
+
+En esta sección se extiende la estimación de la Regla de Taylor incorporando un conjunto de variables macroeconómicas adicionales (controles). Para evitar sobreajuste y permitir que el propio modelo determine cuáles de estos controles son realmente relevantes, se utiliza un enfoque bayesiano con un prior tipo LASSO (distribución Laplace), que induce shrinkage sobre todos los coeficientes adicionales.
+Los coeficientes centrales de la Regla de Taylor —inercia, brecha de inflación y output gap— se mantienen con priors informativos fuertes asegurando que LASSO actúe únicamente sobre los controles. Este enfoque permite evaluar simultáneamente la robustez de la regla y el aporte marginal de variables macroeconómicas adicionales.
+Los controles que estaremos usando son los siguientes:
+
+- **TCU**: Capacity Utilization: Total Industry (Percent of Capacity)
+- **USGOVT**: All Employees: Government (Thousands of Persons)
+- **UNRATE**: Civilian Unemployment Rate (Percent)
+- **DGDSRG3Q086SBEA**: Personal consumption expenditures: Goods (chain-type price index)
+- **GS10TB3Mx**: 10-Year Treasury Constant Maturity Minus 3-Month Treasury Bill, secondary market (Percent)
+- **CPF3MTB3Mx**: 3-Month Commercial Paper Minus 3-Month Treasury Bill, secondary market (Percent)
+- **BOGMBASEREALx**: St. Louis Adjusted Monetary Base (Billions of 1982-84 Dollars), deflated by CPI
+
+
+```{r controls, message=FALSE, warning=FALSE, results='hide'} 
+controls <- c("TCU","USGOVT","UNRATE","DGDSRG3Q086SBEA",
+                  "GS10TB3Mx","CPF3MTB3Mx","BOGMBASEREALx")
+
+# Estandarizamos variables de control  
+df_reg_sub <- df_reg_sub %>%
+ mutate(across(all_of(controls), ~ as.numeric(scale(.x))))
+
+# Fórmula    
+form_v3 <- bf( FEDFUNDS ~ i_lag1 + pi_gap + y_gap + TCU + USGOVT + UNRATE + DGDSRG3Q086SBEA + GS10TB3Mx + CPF3MTB3Mx + BOGMBASEREALx )
+
+priors_v3 <- c(
+  # Intercepto
+  prior(normal(0, 5.0), class = "Intercept"),
+  
+  # LASSO general para todos los betas - equivale a 1/lambda, así que si ->0 mayor es la penalización (shrinkage)
+  prior(double_exponential(0, 0.2), class = "b"),
+  
+  # Núcleo BIS con priors normales fuertes
+  prior(normal(0.74, 0.10), class = "b", coef = "i_lag1"),
+  prior(normal(2.11, 0.10), class = "b", coef = "pi_gap"),
+  prior(normal(0.26, 0.05), class = "b", coef = "y_gap"),
+  
+  # Sigma débil
+  prior(student_t(3, 0, 10), class = "sigma")
+)
+
+# Ajuste
+set.seed(42)
+
+taylor_bayes_v3_brms <- brm(
+  formula = form_v3,
+  data    = df_reg_sub,
+  family  = gaussian(),
+  prior   = priors_v3,
+  chains = 4,
+  iter   = 15000,
+  warmup = 5000,
+  cores  = 4,
+  seed   = 42,
+  sample_prior = "yes"
+)
+```
+
+```{r controls_summ, message=FALSE, warning=FALSE} 
+summary(taylor_bayes_v3_brms)
+```
+La estimación bayesiana con prior LASSO muestra que los coeficientes principales de la Regla de Taylor (inercia, brecha de inflación y output gap) se mantienen significativos y con magnitudes consistentes con las versiones anteriores. En cambio, la mayoría de las variables de control presentan distribuciones posteriores centradas cerca de cero y con intervalos amplios, indicando que el shrinkage penaliza fuertemente su aporte marginal. Solo GS10TB3Mx muestra evidencia moderada de efecto. En conjunto, el modelo confirma que la dinámica de tasas está explicada casi por completo por los componentes centrales de la regla.
+
+## Visualización de Resultados    
+
+```{r controls_viz, message=FALSE, warning=FALSE} 
+# Visualizacion de controles
+controls_b <- c("b_TCU","b_USGOVT","b_UNRATE","b_DGDSRG3Q086SBEA",
+                "b_GS10TB3Mx","b_CPF3MTB3Mx","b_BOGMBASEREALx")
+
+as_draws_df(taylor_bayes_v3_brms) %>%
+  dplyr::select(all_of(controls_b)) %>%
+  pivot_longer(everything(), names_to="term", values_to="value") %>%
+  ggplot(aes(x=value, y=term)) +
+  stat_halfeye(.width = 0.95) +
+  geom_vline(xintercept=0, linetype="dashed") +
+  labs(title="Controles con prior LASSO: posterior",
+       subtitle="Los que quedan concentrados en 0 no aportan",
+       x="Coeficiente", y=NULL) +
+  theme_minimal()
+```
+
+Este gráfico muestra la distribución posterior de los coeficientes asociados a las variables de control bajo el prior LASSO.
+Las distribuciones que quedan concentradas alrededor de cero indican que, dado el shrinkage aplicado, esas variables no aportan información relevante.
+
+```{r lambdas, message=FALSE, warning=FALSE, results='hide'} 
+
+# Comparación de Lambdas
+
+# grilla de scales (b): de débil a fuerte
+b_grid <- c(1.0, 0.7, 0.5, 0.3, 0.2, 0.15, 0.1, 0.07, 0.05, 0.025)
+
+# Funcion que arma priors con cada b
+make_priors_v3 <- function(b_scale){
+  
+  laplace_str <- paste0("double_exponential(0, ", b_scale, ")")
+  
+  c(
+    # Intercepto
+    set_prior("normal(0, 5.0)", class = "Intercept"),
+    
+    # LASSO general para todos los coeficientes b
+    set_prior(laplace_str, class = "b"),
+    
+    # Sobrescribo núcleo BIS con normales fuertes
+    set_prior("normal(0.74, 0.10)", class = "b", coef = "i_lag1"),
+    set_prior("normal(2.11, 0.10)", class = "b", coef = "pi_gap"),
+    set_prior("normal(0.26, 0.05)", class = "b", coef = "y_gap"),
+    
+    # sigma débil
+    set_prior("student_t(3, 0, 10)", class = "sigma")
+  )
+}
+
+
+# Reestimar modelos para cada b
+
+fits_v3 <- map(b_grid, ~ brm(
+  formula = form_v3,
+  data    = df_reg_sub,
+  family  = gaussian(),
+  prior   = make_priors_v3(.x),
+  chains  = 4,
+  iter    = 4000,
+  warmup  = 1000,
+  cores   = 4,
+  seed    = 42,
+  refresh = 0 
+))
+
+
+names(fits_v3) <- paste0("b_", b_grid)
+
+# Extraer cofiecientes de controles y construir el path
+core_vars <- c("i_lag1", "pi_gap", "y_gap")
+core_b <- paste0("b_", core_vars)
+
+# obtiene nombres b_ reales desde cualquier fit brms
+get_controls_b <- function(fit) {
+  b_names <- grep("^b_", posterior::variables(as_draws_df(fit)), value = TRUE)
+  setdiff(b_names, core_b)
+}
+
+controls_b <- get_controls_b(fits_v3[[1]])  # usar el primer fit como referencia
+controls_b
+
+# función para extraer el coeficiente "moda" del vector
+get_mode <- function(x) {
+  d <- density(x)
+  d$x[which.max(d$y)]
+}
+
+
+paths_df_map <- map2_dfr(fits_v3, b_grid, ~ {
+  # extraer draws de los coeficientes de controles
+  draws <- as_draws_df(.x) %>%
+    dplyr::select(all_of(controls_b)) %>%
+    pivot_longer(everything(), names_to="term", values_to="value") %>%
+    # excluir intercepto
+    filter(term != "b_Intercept") %>%
+    group_by(term) %>%
+    summarise(
+      map = get_mode(value),
+      .groups="drop"
+    )
+  
+  draws %>%
+    mutate(
+      b_scale = .y,
+      log_lambda = log(1/.y)   # lambda clásica = 1/b
+    )
+})
+
+# Graficar coeficient path con MAP (sin intercepto)
+ggplot(paths_df_map, aes(x = log_lambda, y = map, color = term)) +
+  geom_line(linewidth = 0.9) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(
+    title = "Coeficient paths para controles (v3)",
+    subtitle = "A mayor log(lambda) = mayor shrinkage (b más chico)",
+    x = "log(lambda)  [lambda = 1 / b_scale]",
+    y = "Moda posterior del coeficiente"
+  ) +
+  theme_minimal() +
+  theme(legend.title = element_blank())
+
+```
+
+En este caso, se puede ver cómo cambian los coeficientes de las variables de control a medida que aumenta la penalización LASSO. A medida que el shrinkage se intensifica, todos los coeficientes se contraen progresivamente hacia cero. Las variables cuyos coeficientes caen rápidamente indican menor relevancia explicativa, mientras que las que resisten más tiempo alejadas de cero son las que el modelo considera relativamente más informativas.
+
+
